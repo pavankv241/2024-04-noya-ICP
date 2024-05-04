@@ -197,6 +197,7 @@ contract AccountingManager is IAccountingManager, ERC4626, ReentrancyGuard, Paus
     * @dev this function is used to deposit base token to the vault
     * @dev the deposit request is recorded to the deposit queue
     **/
+    // @audit Bug dust amount can slow the queue process.
     function deposit(address receiver, uint256 amount, address referrer) public nonReentrant whenNotPaused {
         if (amount == 0) {
             revert NoyaAccounting_INVALID_AMOUNT();
@@ -236,6 +237,7 @@ contract AccountingManager is IAccountingManager, ERC4626, ReentrancyGuard, Paus
             i += 1;
             DepositRequest storage data = depositQueue.queue[middleTemp];
 
+            // @audit check here about shares.
             uint256 shares = previewDeposit(data.amount);
             data.shares = shares;
             data.calculationTime = block.timestamp;
@@ -341,16 +343,23 @@ contract AccountingManager is IAccountingManager, ERC4626, ReentrancyGuard, Paus
         ) {
             i += 1;
             WithdrawRequest storage data = withdrawQueue.queue[middleTemp];
+
             uint256 assets = previewRedeem(data.shares);
+
             data.amount = assets;
+
             data.calculationTime = block.timestamp;
+
             assetsNeededForWithdraw += assets;
+
             processedShares += data.shares;
+
             emit CalculateWithdraw(middleTemp, data.owner, data.receiver, data.shares, assets, block.timestamp);
 
             middleTemp += 1;
         }
         currentWithdrawGroup.totalCBAmount += assetsNeededForWithdraw;
+
         withdrawQueue.middle = middleTemp;
     }
 
@@ -371,18 +380,26 @@ contract AccountingManager is IAccountingManager, ERC4626, ReentrancyGuard, Paus
         require(currentWithdrawGroup.isStarted == true && currentWithdrawGroup.isFullfilled == false);
         uint256 neededAssets = neededAssetsForWithdraw();
 
+        // Amount Asked for withdraw has to be same in  amountAskedForWithdraw == assetsNeededForWithdraw.
+        //                                  currentWithdrawGroup.totalCBAmount == assetsNeededForWithdraw.
+
         if (neededAssets != 0 && amountAskedForWithdraw != currentWithdrawGroup.totalCBAmount) {
             revert NoyaAccounting_NOT_READY_TO_FULFILL();
         }
         currentWithdrawGroup.isFullfilled = true;
+
         amountAskedForWithdraw = 0;
+
         uint256 availableAssets = baseToken.balanceOf(address(this)) - depositQueue.totalAWFDeposit;
+
+        // BUG here below attacker can make available balance more than expected by sending the tokens directly which the affect the executeWithdraw function
         if (availableAssets >= currentWithdrawGroup.totalCBAmount) {
             currentWithdrawGroup.totalABAmount = currentWithdrawGroup.totalCBAmount;
         } else {
             currentWithdrawGroup.totalABAmount = availableAssets;
         }
         currentWithdrawGroup.totalCBAmountFullfilled = currentWithdrawGroup.totalCBAmount;
+
         currentWithdrawGroup.totalCBAmount = 0;
         emit WithdrawGroupFulfilled(
             currentWithdrawGroup.lastId, currentWithdrawGroup.totalCBAmount, currentWithdrawGroup.totalABAmount
@@ -412,6 +429,7 @@ contract AccountingManager is IAccountingManager, ERC4626, ReentrancyGuard, Paus
             WithdrawRequest memory data = withdrawQueue.queue[firstTemp];
             uint256 shares = data.shares;
             // calculate the base token amount that the user will receive based on the total available amount
+            //Bug here look into here.
             uint256 baseTokenAmount =
                 data.amount * currentWithdrawGroup.totalABAmount / currentWithdrawGroup.totalCBAmountFullfilled;
 
@@ -613,6 +631,7 @@ contract AccountingManager is IAccountingManager, ERC4626, ReentrancyGuard, Paus
     }
     /// @notice if the withdraw group is not fullfilled, we can get the needed assets for the withdraw using this function
 
+ // BUG definitealy Please look into again.
     function neededAssetsForWithdraw() public view returns (uint256) {
         uint256 availableAssets = baseToken.balanceOf(address(this)) - depositQueue.totalAWFDeposit;
         if ( // check if the withdraw group is fullfilled

